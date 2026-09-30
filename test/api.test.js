@@ -1,0 +1,185 @@
+// 🧪 ডাটাবেজ ছাড়া API টেস্ট — মডেলের মেথড stub করে নিরাপত্তা ও লজিক যাচাই
+process.env.NODE_ENV = 'test';
+process.env.JWT_SECRET = 'test-secret';
+
+const test = require('node:test');
+const assert = require('node:assert');
+const mongoose = require('mongoose');
+
+mongoose.set('bufferCommands', false);
+
+const app = require('../server');
+const Admin = require('../models/Admin');
+const Driver = require('../models/Driver');
+const Trip = require('../models/Trip');
+const TripApplication = require('../models/TripApplication');
+const TripHistory = require('../models/TripHistory');
+const { signToken } = require('../utils/auth');
+
+const adminId = new mongoose.Types.ObjectId();
+const driverId = new mongoose.Types.ObjectId();
+const adminToken = signToken(adminId, 'admin');
+const driverToken = signToken(driverId, 'driver');
+
+let server, base;
+test.before(async () => {
+  server = app.listen(0);
+  await new Promise((r) => server.once('listening', r));
+  base = `http://127.0.0.1:${server.address().port}`;
+  // ইউজার খোঁজার stub
+  Admin.findById = async (id) => (String(id) === String(adminId) ? { _id: adminId, name: 'A', phone: '01700000000' } : null);
+  Driver.findById = async (id) => (String(id) === String(driverId) ? {
+    _id: driverId, driverName: 'D', phone: '01711111111', truckType: 'Truck', truckCapacity: 5, vehicleBody: 'open', currentLocation: {}
+  } : null);
+});
+test.after(() => server.close());
+
+const call = (method, path, { token, body, headers = {} } = {}) =>
+  fetch(base + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+    body: body ? JSON.stringify(body) : undefined,
+  }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) }));
+
+test('protected routes reject requests without a token', async () => {
+  const routes = [
+    ['GET', '/api/drivers/all'],
+    ['DELETE', `/api/drivers/${driverId}`],
+    ['POST', '/api/drivers/location'],
+    ['GET', '/api/drivers/history'],
+    ['GET', `/api/drivers/history/${driverId}`],
+    ['POST', '/api/trips/add'],
+    ['POST', '/api/trips/apply-trip'],
+    ['GET', `/api/trips/applications/${driverId}`],
+    ['POST', '/api/trips/confirm-driver'],
+    ['DELETE', `/api/trips/${driverId}`],
+    ['GET', '/api/trips/history/last-7-days'],
+    ['GET', '/api/admin/me'],
+  ];
+  for (const [m, p] of routes) {
+    const r = await call(m, p, { body: m === 'GET' || m === 'DELETE' ? undefined : {} });
+    assert.strictEqual(r.status, 401, `${m} ${p} returned ${r.status}`);
+  }
+});
+
+test('driver token cannot use admin routes', async () => {
+  for (const [m, p] of [['GET', '/api/drivers/all'], ['POST', '/api/trips/add'], ['POST', '/api/trips/confirm-driver'], ['DELETE', `/api/drivers/${driverId}`]]) {
+    const r = await call(m, p, { token: driverToken, body: m === 'POST' ? {} : undefined });
+    assert.strictEqual(r.status, 403, `${m} ${p}`);
+  }
+});
+
+test('admin token cannot use driver routes', async () => {
+  const r = await call('POST', '/api/trips/apply-trip', { token: adminToken, body: {} });
+  assert.strictEqual(r.status, 403);
+});
+
+test('forged / expired token is rejected', async () => {
+  const jwt = require('jsonwebtoken');
+  const bad = jwt.sign({ id: String(adminId), role: 'admin' }, 'wrong-secret');
+  assert.strictEqual((await call('GET', '/api/drivers/all', { token: bad })).status, 401);
+  const expired = jwt.sign({ id: String(adminId), role: 'admin' }, 'test-secret', { expiresIn: -10 });
+  assert.strictEqual((await call('GET', '/api/drivers/all', { token: expired })).status, 401);
+});
+
+test('admin/create is closed without setup key', async () => {
+  const r = await call('POST', '/api/admin/create', { body: { name: 'x', phone: '01700000000', password: '12345678' } });
+  assert.strictEqual(r.status, 403);
+});
+
+test('NoSQL operator injection in login is refused', async () => {
+  const r1 = await call('POST', '/api/admin/login', { body: { phone: { $ne: null }, password: 'x' } });
+  assert.strictEqual(r1.status, 400);
+  const r2 = await call('POST', '/api/drivers/login', { body: { phone: { $gt: '' }, password: { $ne: 1 } } });
+  assert.strictEqual(r2.status, 400);
+});
+
+test('trip add validates cargoDetails with a clear message', async () => {
+  const r = await call('POST', '/api/trips/add', {
+    token: adminToken,
+    body: { from: 'ঢাকা', to: 'চট্টগ্রাম', cargoDetails: '', requiredVehicleBody: 'open', fixedPrice: 5000, pickupTime: 'x' },
+  });
+  assert.strictEqual(r.status, 400);
+  assert.match(r.body.message, /মালামাল/);
+});
+
+test('driver login returns fields the frontend reads', async () => {
+  const bcrypt = require('bcrypt');
+  const hash = await bcrypt.hash('secret1', 4);
+  const orig = Driver.findOne;
+  Driver.findOne = (filter) => ({
+    select: async () => {
+      // phone ফিল্টার trusted $in হওয়া উচিত (+88 ফরম্যাটও মিলবে)
+      assert.ok(filter.phone.$in.includes('01711111111'));
+      return { _id: driverId, driverName: 'D', phone: '01711111111', truckType: 'Truck', truckCapacity: 5, vehicleBody: 'open', passwordHash: hash };
+    },
+  });
+  const r = await call('POST', '/api/drivers/login', { body: { phone: '+8801711111111', password: 'secret1' } });
+  Driver.findOne = orig;
+  assert.strictEqual(r.status, 200);
+  for (const k of ['id', '_id', 'driverName', 'truckType', 'phone']) assert.ok(r.body.driver[k], `missing ${k}`);
+  // টোকেন দিয়ে ড্রাইভার রাউটে ঢোকা যায়
+  const me = await call('GET', '/api/drivers/me', { token: r.body.token });
+  assert.strictEqual(me.status, 200);
+});
+
+test('apply-trip uses driver from token, not from body', async () => {
+  const tripId = new mongoose.Types.ObjectId();
+  const saved = [];
+  const o = { fb: Trip.findById, fo: TripApplication.findOne, c: TripApplication.create, u: Driver.updateOne };
+  Trip.findById = async () => ({ _id: tripId, status: 'pending' });
+  TripApplication.findOne = async () => null;
+  TripApplication.create = async (doc) => { saved.push(doc); return doc; };
+  Driver.updateOne = async () => ({});
+  const other = new mongoose.Types.ObjectId();
+  const r = await call('POST', '/api/trips/apply-trip', {
+    token: driverToken,
+    body: { tripId: String(tripId), driverId: String(other), currentLocation: { lat: 23.8, lng: 90.4 } },
+  });
+  Object.assign(Trip, { findById: o.fb }); Object.assign(TripApplication, { findOne: o.fo, create: o.c }); Driver.updateOne = o.u;
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(String(saved[0].driverId), String(driverId));
+});
+
+test('confirm-driver: second confirm gets 409, capacity copied, others rejected', async () => {
+  const tripId = new mongoose.Types.ObjectId();
+  const o = { fo: TripApplication.findOne, ex: Driver.exists, foau: Trip.findOneAndUpdate, tex: Trip.exists, hc: TripHistory.create, uo: TripApplication.updateOne, um: TripApplication.updateMany };
+  let locked = false; const history = []; const rejected = [];
+  TripApplication.findOne = async () => ({ _id: new mongoose.Types.ObjectId(), driverId, driverName: 'D', phone: '01711111111', truckType: 'T', truckCapacity: 5, vehicleBody: 'open', currentLocation: {} });
+  Driver.exists = async () => ({ _id: driverId });
+  Trip.findOneAndUpdate = async (filter) => {
+    assert.strictEqual(filter.status, 'pending');
+    if (locked) return null;
+    locked = true;
+    return { _id: tripId, from: 'A', to: 'B', cargoDetails: 'C', requiredVehicleBody: 'open', requiredCapacity: 7, fixedPrice: 100, pickupTime: 't' };
+  };
+  Trip.exists = async () => ({ _id: tripId });
+  TripHistory.create = async (d) => { history.push(d); return d; };
+  TripApplication.updateOne = async () => ({});
+  TripApplication.updateMany = async (f, u) => { rejected.push(u.status); return {}; };
+  const body = { tripId: String(tripId), driverId: String(driverId) };
+  const r1 = await call('POST', '/api/trips/confirm-driver', { token: adminToken, body });
+  const r2 = await call('POST', '/api/trips/confirm-driver', { token: adminToken, body });
+  Object.assign(TripApplication, { findOne: o.fo, updateOne: o.uo, updateMany: o.um });
+  Object.assign(Trip, { findOneAndUpdate: o.foau, exists: o.tex });
+  Driver.exists = o.ex; TripHistory.create = o.hc;
+  assert.strictEqual(r1.status, 200);
+  assert.strictEqual(r2.status, 409);
+  assert.strictEqual(history.length, 1);
+  assert.strictEqual(history[0].tripDetails.requiredCapacity, 7);
+  assert.deepStrictEqual(rejected, ['rejected']);
+});
+
+test('bad JSON and unknown routes give clean errors (no internals leaked)', async () => {
+  const r = await fetch(base + '/api/drivers/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{bad' });
+  assert.strictEqual(r.status, 400);
+  const nf = await call('GET', '/api/nothing');
+  assert.strictEqual(nf.status, 404);
+});
+
+test('CORS allows only the real site', async () => {
+  const ok = await fetch(base + '/api/trips/active', { method: 'OPTIONS', headers: { Origin: 'https://desh-transport.vercel.app', 'Access-Control-Request-Method': 'GET' } });
+  assert.strictEqual(ok.headers.get('access-control-allow-origin'), 'https://desh-transport.vercel.app');
+  const bad = await fetch(base + '/api/trips/active', { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'GET' } });
+  assert.strictEqual(bad.headers.get('access-control-allow-origin'), null);
+});

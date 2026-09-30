@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const router = express.Router();
 
 
@@ -7,6 +8,12 @@ const Driver = require('../models/Driver');
 const TripHistory = require('../models/TripHistory');
 const TripApplication = require('../models/TripApplication');
 
+const { requireAdmin, requireDriver } = require('../middleware/authenticate');
+const { normalizeLocation } = require('../utils/location');
+
+
+const isId = (value) => typeof value === 'string' && mongoose.isValidObjectId(value);
+const isText = (value) => typeof value === 'string' && value.trim().length > 0;
 
 
 
@@ -15,7 +22,7 @@ const TripApplication = require('../models/TripApplication');
 // Admin - নতুন ট্রিপ যুক্ত করুন
 // ======================================
 
-router.post('/add', async(req,res)=>{
+router.post('/add', requireAdmin, async(req,res,next)=>{
 
 
 try{
@@ -27,11 +34,51 @@ from,
 to,
 cargoDetails,
 requiredVehicleBody,
-requiredCapacity,
-fixedPrice,
-pickupTime
+pickupTime,
+pickupAt
 
 }=req.body;
+
+const fixedPrice = Number(req.body.fixedPrice);
+const requiredCapacity =
+req.body.requiredCapacity === '' || req.body.requiredCapacity == null
+? null
+: Number(req.body.requiredCapacity);
+
+
+// 🛡️ ইনপুট যাচাই — কোন তথ্য বাকি তা পরিষ্কারভাবে বলা হবে
+
+if(!isText(from) || !isText(to)){
+return res.status(400).json({ message:"কোথা থেকে এবং কোথায় যাবে লিখুন" });
+}
+
+if(!isText(cargoDetails)){
+return res.status(400).json({ message:"মালামালের বিবরণ লিখুন" });
+}
+
+if(!['covered','open'].includes(requiredVehicleBody)){
+return res.status(400).json({ message:"গাড়ির বডি টাইপ বেছে নিন" });
+}
+
+if(!Number.isFinite(fixedPrice) || fixedPrice <= 0){
+return res.status(400).json({ message:"সঠিক ভাড়া লিখুন" });
+}
+
+if(requiredCapacity !== null && (!Number.isFinite(requiredCapacity) || requiredCapacity < 0)){
+return res.status(400).json({ message:"সঠিক ধারণক্ষমতা লিখুন" });
+}
+
+if(!isText(pickupTime)){
+return res.status(400).json({ message:"পিকআপের তারিখ ও সময় দিন" });
+}
+
+let pickupDate = null;
+if(pickupAt){
+pickupDate = new Date(pickupAt);
+if(Number.isNaN(pickupDate.getTime())){
+return res.status(400).json({ message:"পিকআপের তারিখ সঠিক নয়" });
+}
+}
 
 
 
@@ -39,11 +86,11 @@ pickupTime
 const trip = await Trip.create({
 
 
-from,
+from:from.trim(),
 
-to,
+to:to.trim(),
 
-cargoDetails,
+cargoDetails:cargoDetails.trim(),
 
 requiredVehicleBody,
 
@@ -51,7 +98,9 @@ requiredCapacity,
 
 fixedPrice,
 
-pickupTime
+pickupTime:pickupTime.trim(),
+
+pickupAt:pickupDate
 
 
 });
@@ -62,7 +111,7 @@ pickupTime
 
 res.status(201).json({
 
-message:"ট্রিপ সফলভাবে যুক্ত হয়েছে",
+message:"ট্রিপ সফলভাবে যুক্ত হয়েছে",
 
 trip
 
@@ -75,13 +124,7 @@ trip
 }catch(error){
 
 
-res.status(500).json({
-
-message:"ট্রিপ যুক্ত করা যায়নি",
-
-error:error.message
-
-});
+next(error);
 
 
 }
@@ -99,10 +142,10 @@ error:error.message
 
 
 // ======================================
-// Live Active Trips
+// Live Active Trips (সবার জন্য খোলা — এখানে কোনো ব্যক্তিগত তথ্য নেই)
 // ======================================
 
-router.get('/active', async(req,res)=>{
+router.get('/active', async(req,res,next)=>{
 
 
 try{
@@ -132,11 +175,7 @@ res.json(trips);
 }catch(error){
 
 
-res.status(500).json({
-
-message:"ট্রিপ পাওয়া যায়নি"
-
-});
+next(error);
 
 
 }
@@ -155,10 +194,12 @@ message:"ট্রিপ পাওয়া যায়নি"
 
 // ======================================
 // Driver - ট্রিপ নিতে চাই
+// 🛡️ driverId এখন টোকেন থেকে নেওয়া হয়, body থেকে নয় —
+// তাই কেউ অন্যের নামে আবেদন করতে পারবে না
 // ======================================
 
 
-router.post('/apply-trip', async(req,res)=>{
+router.post('/apply-trip', requireDriver, async(req,res,next)=>{
 
 
 try{
@@ -168,14 +209,16 @@ const {
 
 tripId,
 
-driverId,
-
 currentLocation
 
 }=req.body;
 
 
+if(!isId(tripId)){
 
+return res.status(400).json({ message:"ট্রিপ পাওয়া যায়নি" });
+
+}
 
 
 
@@ -185,12 +228,12 @@ await Trip.findById(tripId);
 
 
 
-if(!trip){
+if(!trip || trip.status !== 'pending'){
 
 
 return res.status(404).json({
 
-message:"ট্রিপ পাওয়া যায়নি"
+message:"ট্রিপটি আর পাওয়া যাচ্ছে না"
 
 });
 
@@ -200,33 +243,7 @@ message:"ট্রিপ পাওয়া যায়নি"
 
 
 
-
-
-
-
-const driver =
-await Driver.findById(driverId);
-
-
-
-
-
-if(!driver){
-
-
-return res.status(404).json({
-
-message:"ড্রাইভার পাওয়া যায়নি"
-
-});
-
-
-}
-
-
-
-
-
+const driver = req.user;
 
 
 
@@ -239,7 +256,7 @@ await TripApplication.findOne({
 
 tripId,
 
-driverId
+driverId:driver._id
 
 });
 
@@ -253,7 +270,7 @@ if(oldApply){
 
 return res.status(400).json({
 
-message:"আপনি আগে থেকেই এই ট্রিপ নিতে চেয়েছেন"
+message:"আপনি আগে থেকেই এই ট্রিপ নিতে চেয়েছেন"
 
 });
 
@@ -262,8 +279,19 @@ message:"আপনি আগে থেকেই এই ট্রিপ নিত
 
 
 
+const location =
+normalizeLocation(currentLocation) || driver.currentLocation;
 
 
+// ড্রাইভারের সর্বশেষ লোকেশনও আপডেট
+if(normalizeLocation(currentLocation)){
+
+await Driver.updateOne(
+{ _id:driver._id },
+{ currentLocation:location }
+);
+
+}
 
 
 
@@ -316,7 +344,7 @@ driver.vehicleBody,
 
 currentLocation:
 
-currentLocation || driver.currentLocation
+location
 
 
 
@@ -337,7 +365,7 @@ res.json({
 
 message:
 
-"আপনার অনুরোধ এডমিনের কাছে পাঠানো হয়েছে"
+"আপনার অনুরোধ এডমিনের কাছে পাঠানো হয়েছে"
 
 
 });
@@ -351,17 +379,19 @@ message:
 }catch(error){
 
 
+// একই সাথে দুবার ক্লিক করলে unique index এ ধরা পড়ে
+if(error.code === 11000){
 
-res.status(500).json({
+return res.status(400).json({
 
-
-message:"সমস্যা হয়েছে",
-
-
-error:error.message
-
+message:"আপনি আগে থেকেই এই ট্রিপ নিতে চেয়েছেন"
 
 });
+
+}
+
+
+next(error);
 
 
 
@@ -369,12 +399,44 @@ error:error.message
 
 
 
-});// ======================================
+});
+
+
+
+
+// ======================================
+// Driver - আমি কোন কোন ট্রিপে আবেদন করেছি
+// ======================================
+
+router.get('/my-applications', requireDriver, async(req,res,next)=>{
+
+try{
+
+const applications =
+await TripApplication.find({ driverId:req.user._id })
+.select('tripId status appliedAt')
+.sort({ appliedAt:-1 })
+.limit(200);
+
+res.json(applications);
+
+}catch(error){
+
+next(error);
+
+}
+
+});
+
+
+
+
+// ======================================
 // Admin - Driver Response দেখার API
 // ======================================
 
-router.get('/applications/:tripId',
-async(req,res)=>{
+router.get('/applications/:tripId', requireAdmin,
+async(req,res,next)=>{
 
 
 try{
@@ -407,13 +469,7 @@ res.json(applications);
 }catch(error){
 
 
-res.status(500).json({
-
-message:"ড্রাইভার লিস্ট পাওয়া যায়নি",
-
-error:error.message
-
-});
+next(error);
 
 
 }
@@ -432,10 +488,12 @@ error:error.message
 
 // ======================================
 // Admin - Driver Confirm
+// 🛡️ ট্রিপটি "pending → confirmed" একবারেই লক হয়,
+// তাই দুজন এডমিন একসাথে চাপলেও ট্রিপ দুবার কনফার্ম হবে না
 // ======================================
 
-router.post('/confirm-driver',
-async(req,res)=>{
+router.post('/confirm-driver', requireAdmin,
+async(req,res,next)=>{
 
 
 try{
@@ -450,32 +508,11 @@ driverId
 }=req.body;
 
 
+if(!isId(tripId) || !isId(driverId)){
 
-
-
-
-const trip =
-
-await Trip.findById(tripId);
-
-
-
-
-if(!trip){
-
-
-return res.status(404).json({
-
-message:"ট্রিপ পাওয়া যায়নি"
-
-});
-
+return res.status(400).json({ message:"পাঠানো তথ্য সঠিক নয়" });
 
 }
-
-
-
-
 
 
 
@@ -486,7 +523,9 @@ await TripApplication.findOne({
 
 tripId,
 
-driverId
+driverId,
+
+status:"pending"
 
 });
 
@@ -499,10 +538,63 @@ if(!application){
 
 return res.status(404).json({
 
-message:"ড্রাইভার পাওয়া যায়নি"
+message:"ড্রাইভারের আবেদন পাওয়া যায়নি"
 
 });
 
+
+}
+
+
+
+// মুছে ফেলা ড্রাইভারকে কনফার্ম করা যাবে না
+
+const driverExists =
+await Driver.exists({ _id:driverId });
+
+if(!driverExists){
+
+await TripApplication.deleteOne({ _id:application._id });
+
+return res.status(404).json({
+
+message:"এই ড্রাইভারের অ্যাকাউন্ট আর নেই"
+
+});
+
+}
+
+
+
+
+// ট্রিপ লক (atomic)
+
+const trip =
+
+await Trip.findOneAndUpdate(
+
+{ _id:tripId, status:"pending" },
+
+{ status:"confirmed", confirmedDriver:driverId },
+
+{ new:true }
+
+);
+
+
+
+
+if(!trip){
+
+const exists = await Trip.exists({ _id:tripId });
+
+return res.status(exists ? 409 : 404).json({
+
+message: exists
+? "এই ট্রিপ আগেই কনফার্ম হয়ে গেছে"
+: "ট্রিপ পাওয়া যায়নি"
+
+});
 
 }
 
@@ -516,8 +608,12 @@ message:"ড্রাইভার পাওয়া যায়নি"
 
 // History Save
 
+try{
+
 await TripHistory.create({
 
+
+tripId:trip._id,
 
 
 tripDetails:{
@@ -536,6 +632,12 @@ trip.cargoDetails,
 
 requiredVehicleBody:
 trip.requiredVehicleBody,
+
+
+
+// আগে এটা বাদ পড়ে যেত
+requiredCapacity:
+trip.requiredCapacity,
 
 
 
@@ -601,16 +703,7 @@ application.currentLocation
 
 
 
-},
-
-
-
-
-
-
-finalPrice:
-
-trip.fixedPrice
+}
 
 
 
@@ -618,6 +711,19 @@ trip.fixedPrice
 
 
 });
+
+}catch(historyError){
+
+// হিস্ট্রি সেভ না হলে ট্রিপ আবার আগের অবস্থায় ফেরত
+
+await Trip.updateOne(
+{ _id:trip._id },
+{ status:"pending", confirmedDriver:null }
+);
+
+throw historyError;
+
+}
 
 
 
@@ -646,20 +752,29 @@ status:"accepted"
 );
 
 
+// বাকি আবেদনকারীদের "rejected" করা (আগে এগুলো চিরকাল pending থাকত)
 
+await TripApplication.updateMany(
 
+{
 
+tripId:trip._id,
 
+_id:mongoose.trusted({ $ne:application._id }),
 
+status:"pending"
 
+},
 
-// trip remove from live
+{
 
-await Trip.findByIdAndDelete(
+status:"rejected"
 
-tripId
+}
 
 );
+
+
 
 
 
@@ -672,7 +787,7 @@ res.json({
 
 message:
 
-"ড্রাইভার সফলভাবে কনফার্ম হয়েছে"
+"ড্রাইভার সফলভাবে কনফার্ম হয়েছে"
 
 
 });
@@ -685,16 +800,7 @@ message:
 }catch(error){
 
 
-res.status(500).json({
-
-
-message:"কনফার্ম সমস্যা হয়েছে",
-
-
-error:error.message
-
-
-});
+next(error);
 
 
 }
@@ -716,18 +822,25 @@ error:error.message
 // ======================================
 
 
-router.delete('/:id',
-async(req,res)=>{
+router.delete('/:id', requireAdmin,
+async(req,res,next)=>{
 
 
 try{
 
 
-await Trip.findByIdAndDelete(
+const trip = await Trip.findByIdAndDelete(
 
 req.params.id
 
 );
+
+
+if(!trip){
+
+return res.status(404).json({ message:"ট্রিপ পাওয়া যায়নি" });
+
+}
 
 
 
@@ -745,7 +858,7 @@ tripId:req.params.id
 
 res.json({
 
-message:"ট্রিপ মুছে ফেলা হয়েছে"
+message:"ট্রিপ মুছে ফেলা হয়েছে"
 
 });
 
@@ -754,11 +867,7 @@ message:"ট্রিপ মুছে ফেলা হয়েছে"
 }catch(error){
 
 
-res.status(500).json({
-
-error:error.message
-
-});
+next(error);
 
 
 }
@@ -775,7 +884,8 @@ error:error.message
 
 
 // ======================================
-// সফল ট্রিপ (শেষ ৭ দিন)
+// সফল ট্রিপ (শেষ ৭ দিন) — শুধু এডমিন
+// (ড্রাইভাররা নিজেদেরটা দেখবে /api/drivers/history থেকে)
 // ======================================
 
 
@@ -783,7 +893,9 @@ router.get(
 
 '/history/last-7-days',
 
-async(req,res)=>{
+requireAdmin,
+
+async(req,res,next)=>{
 
 
 try{
@@ -808,11 +920,11 @@ const history =
 await TripHistory.find({
 
 
-completedAt:{
+completedAt:mongoose.trusted({
 
 $gte:date
 
-}
+})
 
 
 })
@@ -837,11 +949,7 @@ res.json(history);
 }catch(error){
 
 
-res.status(500).json({
-
-error:error.message
-
-});
+next(error);
 
 
 }

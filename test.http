@@ -2,6 +2,6 @@ POST http://localhost:5000/api/admin/login
 Content-Type: application/json
 
 {
-"phone":"01700000000",
-"password":"123456"
+"phone":"01XXXXXXXXX",
+"password":"<your-password>"
 }

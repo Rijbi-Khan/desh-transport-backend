@@ -6,6 +6,14 @@ const tripHistorySchema = new mongoose.Schema(
   {
 
 
+    // কোন ট্রিপ থেকে এসেছে (পুরোনো হিস্ট্রিতে খালি থাকতে পারে)
+    tripId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Trip',
+      default: null,
+    },
+
+
     // ট্রিপের তথ্য
     tripDetails: {
 
@@ -143,6 +151,13 @@ const tripHistorySchema = new mongoose.Schema(
   }
 );
 
+
+
+// 🛡️ একই ট্রিপ যেন দুবার হিস্ট্রিতে না যায়
+tripHistorySchema.index(
+  { tripId: 1 },
+  { unique: true, partialFilterExpression: { tripId: { $type: 'objectId' } } }
+);
 
 
 module.exports = mongoose.model(
