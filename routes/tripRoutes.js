@@ -10,6 +10,7 @@ const TripApplication = require('../models/TripApplication');
 
 const { requireAdmin, requireDriver } = require('../middleware/authenticate');
 const { normalizeLocation } = require('../utils/location');
+const { withPlaceName } = require('../utils/geocode');
 
 
 const isId = (value) => typeof value === 'string' && mongoose.isValidObjectId(value);
@@ -279,19 +280,29 @@ message:"আপনি আগে থেকেই এই ট্রিপ নিত
 
 
 
-const location =
-normalizeLocation(currentLocation) || driver.currentLocation;
+// 📍 আবেদনের সময় সঠিক লোকেশন বাধ্যতামূলক — এডমিন যেন জানে ড্রাইভার কোথায়
+let location =
+normalizeLocation(currentLocation);
+
+if(!location){
+
+return res.status(400).json({
+
+message:"ট্রিপ নিতে আপনার লোকেশন দরকার। ফোনের লোকেশন (GPS) চালু করে অনুমতি দিন।"
+
+});
+
+}
+
+// জায়গার নাম (যেমন: ঘোড়াশাল, পলাশ উপজেলা)
+location = await withPlaceName(location);
 
 
 // ড্রাইভারের সর্বশেষ লোকেশনও আপডেট
-if(normalizeLocation(currentLocation)){
-
 await Driver.updateOne(
 { _id:driver._id },
 { currentLocation:location }
 );
-
-}
 
 
 
@@ -616,6 +627,10 @@ await TripHistory.create({
 tripId:trip._id,
 
 
+// 🚦 কনফার্ম হলে ট্রিপ "চলমান"
+status:"running",
+
+
 tripDetails:{
 
 
@@ -919,19 +934,21 @@ const history =
 
 await TripHistory.find({
 
+$or:[
 
-completedAt:mongoose.trusted({
+{ completedAt:mongoose.trusted({ $gte:date }) },
 
-$gte:date
+{ finishedAt:mongoose.trusted({ $gte:date }) },
 
-})
+{ status:"running" }
 
+]
 
 })
 
 .sort({
 
-completedAt:-1
+updatedAt:-1
 
 });
 
@@ -955,6 +972,167 @@ next(error);
 }
 
 
+
+});
+
+
+
+
+// ======================================
+// Admin - চলমান ট্রিপ (ড্রাইভার কনফার্ম হয়েছে, এখনো শেষ হয়নি)
+// ======================================
+
+router.get('/running', requireAdmin, async(req,res,next)=>{
+
+try{
+
+const running =
+await TripHistory.find({ status:"running" })
+.sort({ completedAt:-1 });
+
+res.json(running);
+
+}catch(error){
+
+next(error);
+
+}
+
+});
+
+
+
+
+// ======================================
+// Admin - ট্রিপ বাতিল (অপেক্ষমাণ বা চলমান যেকোনো ট্রিপ)
+// বাতিল ট্রিপ হিস্ট্রিতে "বাতিল" হিসেবে থাকবে, মুছে যাবে না
+// ======================================
+
+router.post('/:id/cancel', requireAdmin, async(req,res,next)=>{
+
+try{
+
+const reason =
+typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0,300) : '';
+
+if(!reason){
+
+return res.status(400).json({ message:"বাতিলের কারণ লিখুন" });
+
+}
+
+
+// শুধু অপেক্ষমাণ বা চলমান ট্রিপই বাতিল করা যায় (atomic)
+const trip =
+await Trip.findOneAndUpdate(
+{ _id:req.params.id, status:mongoose.trusted({ $in:['pending','confirmed'] }) },
+{ status:"cancelled" },
+{ new:false }
+);
+
+if(!trip){
+
+const exists = await Trip.exists({ _id:req.params.id });
+
+return res.status(exists ? 409 : 404).json({
+
+message: exists ? "এই ট্রিপ আগেই শেষ বা বাতিল হয়েছে" : "ট্রিপ পাওয়া যায়নি"
+
+});
+
+}
+
+const now = new Date();
+
+
+if(trip.status === 'confirmed'){
+
+// চলমান ট্রিপ → হিস্ট্রির রেকর্ড বাতিল
+await TripHistory.updateOne(
+{ tripId:trip._id },
+{ status:"cancelled", cancelReason:reason, finishedAt:now }
+);
+
+}else{
+
+// অপেক্ষমাণ ট্রিপ → ড্রাইভার ছাড়াই হিস্ট্রিতে "বাতিল" রেকর্ড
+await TripHistory.create({
+
+tripId:trip._id,
+
+status:"cancelled",
+
+cancelReason:reason,
+
+finishedAt:now,
+
+tripDetails:{
+from:trip.from,
+to:trip.to,
+cargoDetails:trip.cargoDetails,
+requiredVehicleBody:trip.requiredVehicleBody,
+requiredCapacity:trip.requiredCapacity,
+fixedPrice:trip.fixedPrice,
+pickupTime:trip.pickupTime
+}
+
+});
+
+}
+
+
+// বাকি আবেদনগুলো আর অপেক্ষায় থাকবে না
+await TripApplication.updateMany(
+{ tripId:trip._id, status:"pending" },
+{ status:"rejected" }
+);
+
+
+res.json({ message:"ট্রিপ বাতিল হয়েছে" });
+
+}catch(error){
+
+next(error);
+
+}
+
+});
+
+
+
+
+// ======================================
+// Admin - চলমান ট্রিপ সম্পন্ন
+// ======================================
+
+router.post('/:id/complete', requireAdmin, async(req,res,next)=>{
+
+try{
+
+const trip =
+await Trip.findOneAndUpdate(
+{ _id:req.params.id, status:"confirmed" },
+{ status:"completed" }
+);
+
+if(!trip){
+
+return res.status(409).json({ message:"শুধু চলমান ট্রিপ সম্পন্ন করা যায়" });
+
+}
+
+await TripHistory.updateOne(
+{ tripId:trip._id },
+{ status:"completed", finishedAt:new Date() }
+);
+
+res.json({ message:"ট্রিপ সম্পন্ন হয়েছে ✅" });
+
+}catch(error){
+
+next(error);
+
+}
 
 });
 

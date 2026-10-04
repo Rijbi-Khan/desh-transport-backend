@@ -149,7 +149,9 @@ enum:[
 
 'pending',
 
-'confirmed'
+'confirmed',
+'completed',
+'cancelled'
 
 ],
 

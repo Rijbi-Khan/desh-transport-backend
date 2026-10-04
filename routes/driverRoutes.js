@@ -17,6 +17,7 @@ const {
   signToken
 } = require('../utils/auth');
 const { normalizeLocation } = require('../utils/location');
+const { withPlaceName } = require('../utils/geocode');
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
 
@@ -141,16 +142,20 @@ router.get('/me', requireDriver, (req, res) => {
 // =======================
 router.post('/location', requireDriver, async (req, res, next) => {
   try {
-    const location = normalizeLocation(req.body);
+    let location = normalizeLocation(req.body);
 
     if (!location) {
       return res.status(400).json({ message: 'সঠিক লোকেশন পাওয়া যায়নি' });
     }
 
+    // জায়গার নাম যোগ
+    location = await withPlaceName(location);
+
     await Driver.findByIdAndUpdate(req.user._id, { currentLocation: location });
 
     res.json({
-      message: 'লোকেশন আপডেট হয়েছে'
+      message: 'লোকেশন আপডেট হয়েছে',
+      location
     });
   } catch (error) {
     next(error);

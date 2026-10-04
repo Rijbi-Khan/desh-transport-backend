@@ -77,38 +77,38 @@ const tripHistorySchema = new mongoose.Schema(
       driverId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Driver',
-        required: true,
+        default: null,
         index: true,
       },
 
 
       driverName: {
         type: String,
-        required: true,
+        default: null,
       },
 
 
       phone: {
         type: String,
-        required: true,
+        default: null,
       },
 
 
       truckType: {
         type: String,
-        required: true,
+        default: null,
       },
 
 
       truckCapacity: {
         type: Number,
-        required: true,
+        default: null,
       },
 
 
       vehicleBody: {
         type: String,
-        required: true,
+        default: null,
       },
 
 
@@ -130,10 +130,44 @@ const tripHistorySchema = new mongoose.Schema(
           default: null,
         },
 
+        accuracy: {
+          type: Number,
+          default: null,
+        },
+
+        placeName: {
+          type: String,
+          default: null,
+        },
+
       },
 
     },
 
+
+
+    // 🚦 ট্রিপের অবস্থা
+    // running = চলমান (ড্রাইভার কনফার্ম), completed = সম্পন্ন, cancelled = বাতিল
+    // পুরোনো রেকর্ডে এই ফিল্ড নেই — সেগুলো সম্পন্ন হিসেবে ধরা হবে
+    status: {
+      type: String,
+      enum: ['running', 'completed', 'cancelled'],
+      default: 'completed',
+      index: true,
+    },
+
+    // সম্পন্ন বা বাতিল হওয়ার সময়
+    finishedAt: {
+      type: Date,
+      default: null,
+    },
+
+    // বাতিলের কারণ
+    cancelReason: {
+      type: String,
+      default: null,
+      maxlength: 300,
+    },
 
     // confirm হওয়ার সময়
     completedAt: {

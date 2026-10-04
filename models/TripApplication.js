@@ -184,6 +184,28 @@ type:Date,
 default:Date.now
 
 
+},
+
+
+// GPS কত মিটার পর্যন্ত নির্ভুল
+
+accuracy:{
+
+type:Number,
+
+default:null
+
+},
+
+
+// জায়গার নাম
+
+placeName:{
+
+type:String,
+
+default:null
+
 }
 
 

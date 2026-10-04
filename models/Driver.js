@@ -18,6 +18,18 @@ const locationSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+
+    // GPS কত মিটার পর্যন্ত নির্ভুল
+    accuracy: {
+      type: Number,
+      default: null,
+    },
+
+    // জায়গার নাম (যেমন: ঘোড়াশাল, পলাশ উপজেলা, নরসিংদী জেলা)
+    placeName: {
+      type: String,
+      default: null,
+    },
   },
   { _id: false }
 );

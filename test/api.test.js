@@ -22,6 +22,11 @@ const adminToken = signToken(adminId, 'admin');
 const driverToken = signToken(driverId, 'driver');
 
 let server, base;
+// জায়গার নাম API (Nominatim) এর নকল
+const realFetch = global.fetch;
+global.fetch = (url, opts) => String(url).includes('nominatim')
+  ? Promise.resolve(new Response(JSON.stringify({ address: { town: 'ঘোড়াশাল', county: 'পলাশ উপজেলা', state_district: 'নরসিংদী জেলা' } }), { status: 200 }))
+  : realFetch(url, opts);
 test.before(async () => {
   server = app.listen(0);
   await new Promise((r) => server.once('listening', r));
@@ -55,6 +60,9 @@ test('protected routes reject requests without a token', async () => {
     ['DELETE', `/api/trips/${driverId}`],
     ['GET', '/api/trips/history/last-7-days'],
     ['GET', '/api/admin/me'],
+    ['GET', '/api/trips/running'],
+    ['POST', `/api/trips/${driverId}/cancel`],
+    ['POST', `/api/trips/${driverId}/complete`],
   ];
   for (const [m, p] of routes) {
     const r = await call(m, p, { body: m === 'GET' || m === 'DELETE' ? undefined : {} });
@@ -134,11 +142,15 @@ test('apply-trip uses driver from token, not from body', async () => {
   const other = new mongoose.Types.ObjectId();
   const r = await call('POST', '/api/trips/apply-trip', {
     token: driverToken,
-    body: { tripId: String(tripId), driverId: String(other), currentLocation: { lat: 23.8, lng: 90.4 } },
+    body: { tripId: String(tripId), driverId: String(other), currentLocation: { lat: 23.8, lng: 90.4, accuracy: 12 } },
   });
+  // লোকেশন ছাড়া আবেদন করা যাবে না
+  const noLoc = await call('POST', '/api/trips/apply-trip', { token: driverToken, body: { tripId: String(tripId) } });
   Object.assign(Trip, { findById: o.fb }); Object.assign(TripApplication, { findOne: o.fo, create: o.c }); Driver.updateOne = o.u;
   assert.strictEqual(r.status, 200);
   assert.strictEqual(String(saved[0].driverId), String(driverId));
+  assert.strictEqual(saved[0].currentLocation.placeName, 'ঘোড়াশাল, পলাশ উপজেলা, নরসিংদী জেলা');
+  assert.strictEqual(noLoc.status, 400);
 });
 
 test('confirm-driver: second confirm gets 409, capacity copied, others rejected', async () => {
@@ -182,4 +194,48 @@ test('CORS allows only the real site', async () => {
   assert.strictEqual(ok.headers.get('access-control-allow-origin'), 'https://desh-transport.vercel.app');
   const bad = await fetch(base + '/api/trips/active', { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'GET' } });
   assert.strictEqual(bad.headers.get('access-control-allow-origin'), null);
+});
+
+test('cancel: pending trip goes to history as cancelled, needs reason, only once', async () => {
+  const tripId = new mongoose.Types.ObjectId();
+  const o = { foau: Trip.findOneAndUpdate, ex: Trip.exists, hc: TripHistory.create, hu: TripHistory.updateOne, um: TripApplication.updateMany };
+  let state = 'pending'; const created = []; const rejected = [];
+  Trip.findOneAndUpdate = async (filter, update) => {
+    if (!filter.status.$in.includes(state)) return null;
+    const prev = { _id: tripId, status: state, from: 'A', to: 'B', cargoDetails: 'C', requiredVehicleBody: 'open', requiredCapacity: 3, fixedPrice: 100, pickupTime: 't' };
+    state = update.status; return prev;
+  };
+  Trip.exists = async () => ({ _id: tripId });
+  TripHistory.create = async (d) => { created.push(d); return d; };
+  TripApplication.updateMany = async (f, u) => { rejected.push(u.status); return {}; };
+  const noReason = await call('POST', `/api/trips/${tripId}/cancel`, { token: adminToken, body: {} });
+  const r1 = await call('POST', `/api/trips/${tripId}/cancel`, { token: adminToken, body: { reason: 'মাল প্রস্তুত না' } });
+  const r2 = await call('POST', `/api/trips/${tripId}/cancel`, { token: adminToken, body: { reason: 'আবার' } });
+  const asDriver = await call('POST', `/api/trips/${tripId}/cancel`, { token: driverToken, body: { reason: 'x' } });
+  Object.assign(Trip, { findOneAndUpdate: o.foau, exists: o.ex }); Object.assign(TripHistory, { create: o.hc, updateOne: o.hu }); TripApplication.updateMany = o.um;
+  assert.strictEqual(noReason.status, 400);
+  assert.strictEqual(r1.status, 200);
+  assert.strictEqual(r2.status, 409);
+  assert.strictEqual(asDriver.status, 403);
+  assert.strictEqual(created[0].status, 'cancelled');
+  assert.strictEqual(created[0].cancelReason, 'মাল প্রস্তুত না');
+  assert.deepStrictEqual(rejected, ['rejected']);
+});
+
+test('cancel running trip updates its history; complete works only for running', async () => {
+  const tripId = new mongoose.Types.ObjectId();
+  const o = { foau: Trip.findOneAndUpdate, hu: TripHistory.updateOne, um: TripApplication.updateMany, hc: TripHistory.create };
+  const updates = []; let created = 0;
+  Trip.findOneAndUpdate = async (filter) => ({ _id: tripId, status: 'confirmed' });
+  TripHistory.updateOne = async (f, u) => { updates.push(u.status); return {}; };
+  TripHistory.create = async () => { created++; };
+  TripApplication.updateMany = async () => ({});
+  const c = await call('POST', `/api/trips/${tripId}/cancel`, { token: adminToken, body: { reason: 'গাড়ি নষ্ট' } });
+  const d = await call('POST', `/api/trips/${tripId}/complete`, { token: adminToken });
+  Trip.findOneAndUpdate = async () => null;
+  const e = await call('POST', `/api/trips/${tripId}/complete`, { token: adminToken });
+  Object.assign(Trip, { findOneAndUpdate: o.foau }); Object.assign(TripHistory, { updateOne: o.hu, create: o.hc }); TripApplication.updateMany = o.um;
+  assert.strictEqual(c.status, 200); assert.strictEqual(d.status, 200); assert.strictEqual(e.status, 409);
+  assert.deepStrictEqual(updates, ['cancelled', 'completed']);
+  assert.strictEqual(created, 0);
 });
